@@ -64,3 +64,15 @@ The entry point is `main.rs`, which is annotated `#![windows_subsystem = "window
 ### Dependency philosophy
 
 Dependencies are deliberately minimal (`ureq` with `native-tls`, `serde`, `serde_json`, `dirs`, `windows`, `winres`) and the release profile is tuned for small binary size (`opt-level = "z"`, `lto = true`, `strip = true`, `panic = "abort"`). Prefer hand-rolled helpers over pulling in new crates; the ISO-8601 parser in `poller.rs` is there for exactly this reason.
+
+## Fork workflow
+
+This repository is a fork of `CodeZeno/Claude-Code-Usage-Monitor`. Features developed here are intended to be proposed back upstream via pull request.
+
+**`CLAUDE.md` is fork-local and must never be included in upstream PRs.** When preparing a branch for an upstream PR:
+
+- Base the PR branch on `upstream/main` (not this fork's `main`), or rebase/cherry-pick feature commits onto an upstream-based branch so `CLAUDE.md` is not part of the diff.
+- Do not add `CLAUDE.md` changes to commits that are meant to go upstream.
+- If a PR branch accidentally contains `CLAUDE.md`, drop that commit (or revert the file) before opening the upstream PR.
+
+Day-to-day feature branches should still be based on this fork's `main` so they inherit `CLAUDE.md` automatically.

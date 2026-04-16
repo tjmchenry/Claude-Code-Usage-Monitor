@@ -127,6 +127,16 @@ pub struct Strings {
     pub hour_suffix: &'static str,
     pub minute_suffix: &'static str,
     pub second_suffix: &'static str,
+    pub only_show_while_active: &'static str,
+    pub statusline_hook: &'static str,
+    pub hook_not_configured: &'static str,
+    pub hook_installed: &'static str,
+    pub hook_other_installed: &'static str,
+    pub hook_other_installed_short: &'static str,
+    pub hook_install_prompt: &'static str,
+    pub hook_show_snippet: &'static str,
+    pub hook_uninstall: &'static str,
+    pub hook_backup_created: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

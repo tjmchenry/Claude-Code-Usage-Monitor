@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
@@ -17,15 +18,16 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
+use crate::hook_installer::{self, InstallState};
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::UsageData;
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK,
-    WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    WIDGET_WINDOW_CLASS, WM_APP_HEARTBEAT, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
-use crate::tray_icon;
 use crate::poller;
 use crate::theme;
+use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
@@ -74,6 +76,16 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+
+    // Map of active Claude Code session hashes → last heartbeat time.
+    // The statusLine hook posts WM_APP_HEARTBEAT; the countdown timer sweeps this
+    // map and drops entries older than `stale_session_secs`.
+    active_sessions: HashMap<u64, Instant>,
+    auto_hide_when_idle: bool,
+    stale_session_secs: u64,
+    // True once we've seen at least one heartbeat this run. Before that, auto-hide
+    // is ignored so the widget doesn't silently disappear when the hook isn't wired up.
+    hook_ever_heartbeat: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +119,13 @@ const IDM_LANG_FRENCH: u16 = 43;
 const IDM_LANG_GERMAN: u16 = 44;
 const IDM_LANG_JAPANESE: u16 = 45;
 const IDM_LANG_KOREAN: u16 = 46;
+const IDM_AUTO_HIDE: u16 = 60;
+const IDM_HOOK_STATUS: u16 = 61;
+
+/// Default window of time (seconds) without a heartbeat before a session is considered gone.
+/// Claude Code fires statusLine at <=1 Hz during active sessions, so six seconds covers a
+/// short network stall without rendering a dead session "alive."
+const DEFAULT_STALE_SESSION_SECS: u64 = 6;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -180,6 +199,43 @@ fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
+/// Location of the usage cache that the statusline helper reads from stdout.
+fn current_usage_path() -> PathBuf {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(local)
+        .join("ClaudeCodeUsageMonitor")
+        .join("current_usage.json")
+}
+
+fn write_current_usage_file() {
+    let (session_text, weekly_text, last_poll_ok) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (
+                s.session_text.clone(),
+                s.weekly_text.clone(),
+                s.last_poll_ok,
+            ),
+            None => return,
+        }
+    };
+    if !last_poll_ok {
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "session_text": session_text,
+        "weekly_text": weekly_text,
+    });
+    let path = current_usage_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(&payload) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
@@ -192,6 +248,10 @@ struct SettingsFile {
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
+    #[serde(default)]
+    auto_hide_when_idle: bool,
+    #[serde(default = "default_stale_session_secs")]
+    stale_session_secs: u64,
 }
 
 impl Default for SettingsFile {
@@ -202,6 +262,8 @@ impl Default for SettingsFile {
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
+            auto_hide_when_idle: false,
+            stale_session_secs: default_stale_session_secs(),
         }
     }
 }
@@ -212,6 +274,10 @@ fn default_poll_interval() -> u32 {
 
 fn default_widget_visible() -> bool {
     true
+}
+
+fn default_stale_session_secs() -> u64 {
+    DEFAULT_STALE_SESSION_SECS
 }
 
 fn load_settings() -> SettingsFile {
@@ -243,6 +309,8 @@ fn save_state_settings() {
                 .map(|language| language.code().to_string()),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
+            auto_hide_when_idle: s.auto_hide_when_idle,
+            stale_session_secs: s.stale_session_secs,
         });
     }
 }
@@ -258,19 +326,41 @@ fn tray_icon_data_from_state() -> (Option<f64>, String) {
     }
 }
 
-fn toggle_widget_visibility(hwnd: HWND) {
-    let new_visible = {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.widget_visible = !s.widget_visible;
-            s.widget_visible
-        } else {
-            return;
+/// Resolve whether the window should be shown right now based on the manual
+/// toggle state and, optionally, whether a Claude Code session is active.
+fn compute_effective_visibility(s: &AppState) -> bool {
+    if !s.widget_visible {
+        return false;
+    }
+    if !s.auto_hide_when_idle {
+        return true;
+    }
+    // If we've never seen a heartbeat, assume the hook isn't wired up and keep
+    // the widget visible rather than silently hiding it.
+    if !s.hook_ever_heartbeat {
+        return true;
+    }
+    !s.active_sessions.is_empty()
+}
+
+/// Tracks whether the window is currently shown, so repeated `apply_visibility`
+/// calls (e.g. one per heartbeat) don't thrash position and repaint.
+static WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Apply the currently-computed effective visibility to the window.
+fn apply_visibility(hwnd: HWND) {
+    let should_show = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => compute_effective_visibility(s),
+            None => return,
         }
     };
-    save_state_settings();
+    if WINDOW_SHOWN.swap(should_show, Ordering::Relaxed) == should_show {
+        return;
+    }
     unsafe {
-        if new_visible {
+        if should_show {
             position_at_taskbar();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             render_layered();
@@ -278,6 +368,47 @@ fn toggle_widget_visibility(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
+}
+
+fn toggle_widget_visibility(hwnd: HWND) {
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.widget_visible = !s.widget_visible;
+        } else {
+            return;
+        }
+    }
+    save_state_settings();
+    apply_visibility(hwnd);
+}
+
+fn toggle_auto_hide(hwnd: HWND) {
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.auto_hide_when_idle = !s.auto_hide_when_idle;
+        } else {
+            return;
+        }
+    }
+    save_state_settings();
+    apply_visibility(hwnd);
+}
+
+/// Drop heartbeat entries that haven't been refreshed within `stale_session_secs`.
+/// Returns true if any were removed (caller should re-apply visibility).
+fn sweep_stale_sessions() -> bool {
+    let mut state = lock_state();
+    let Some(s) = state.as_mut() else {
+        return false;
+    };
+    let threshold = Duration::from_secs(s.stale_session_secs);
+    let now = Instant::now();
+    let before = s.active_sessions.len();
+    s.active_sessions
+        .retain(|_, last| now.duration_since(*last) < threshold);
+    s.active_sessions.len() != before
 }
 
 fn now_unix_secs() -> u64 {
@@ -760,13 +891,16 @@ pub fn run() {
                 h
             }
             Err(error) => {
-                diagnose::log_error("startup aborted: unable to create single-instance mutex", error);
+                diagnose::log_error(
+                    "startup aborted: unable to create single-instance mutex",
+                    error,
+                );
                 return;
             }
         }
     };
 
-    let class_name = native_interop::wide_str("ClaudeCodeUsageMonitor");
+    let class_name = native_interop::wide_str(WIDGET_WINDOW_CLASS);
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
@@ -862,6 +996,10 @@ pub fn run() {
                 drag_start_mouse_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                active_sessions: HashMap::new(),
+                auto_hide_when_idle: settings.auto_hide_when_idle,
+                stale_session_secs: settings.stale_session_secs.max(1),
+                hook_ever_heartbeat: false,
             });
         }
 
@@ -916,11 +1054,9 @@ pub fn run() {
         let (tray_pct, tray_tooltip) = tray_icon_data_from_state();
         tray_icon::add(hwnd, tray_pct, &tray_tooltip);
 
-        // Position and show (only if widget_visible preference is true)
+        // Position and show according to the current effective visibility.
         position_at_taskbar();
-        if settings.widget_visible {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
+        apply_visibility(hwnd);
         diagnose::log("window shown");
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
@@ -1542,6 +1678,9 @@ unsafe extern "system" fn wnd_proc(
                     update_display();
                     render_layered();
                     schedule_countdown_timer();
+                    if sweep_stale_sessions() {
+                        apply_visibility(hwnd);
+                    }
                 }
                 TIMER_RESET_POLL => {
                     let sh = SendHwnd::from_hwnd(hwnd);
@@ -1563,6 +1702,19 @@ unsafe extern "system" fn wnd_proc(
             schedule_countdown_timer();
             let (pct, tooltip) = tray_icon_data_from_state();
             tray_icon::update(hwnd, pct, &tooltip);
+            write_current_usage_file();
+            LRESULT(0)
+        }
+        _ if msg == WM_APP_HEARTBEAT => {
+            let session_hash = wparam.0 as u64;
+            {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.active_sessions.insert(session_hash, Instant::now());
+                    s.hook_ever_heartbeat = true;
+                }
+            }
+            apply_visibility(hwnd);
             LRESULT(0)
         }
         WM_APP_UPDATE_CHECK_COMPLETE => {
@@ -1841,6 +1993,12 @@ unsafe extern "system" fn wnd_proc(
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
+                IDM_AUTO_HIDE => {
+                    toggle_auto_hide(hwnd);
+                }
+                IDM_HOOK_STATUS => {
+                    handle_hook_status_click(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1873,6 +2031,87 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+/// Handle a click on the "statusLine hook: <state>" menu item. Based on the
+/// current install state, prompts the user to install, uninstall, or replace.
+fn handle_hook_status_click(hwnd: HWND) {
+    let strings = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.language.strings())
+            .unwrap_or_else(|| LanguageId::English.strings())
+    };
+
+    let state = hook_installer::status();
+    match state {
+        InstallState::NotConfigured => {
+            let prompt = format!(
+                "{}\n\n{}:\n{}",
+                strings.hook_install_prompt,
+                strings.hook_show_snippet,
+                hook_installer::snippet()
+            );
+            if prompt_yes_no(hwnd, strings.statusline_hook, &prompt) {
+                match hook_installer::install() {
+                    Ok(backup) => {
+                        let message = format!(
+                            "{}\n\n{}\n{}",
+                            strings.hook_installed,
+                            strings.hook_backup_created,
+                            backup.display()
+                        );
+                        show_info_message(hwnd, strings.statusline_hook, &message);
+                    }
+                    Err(e) => {
+                        show_error_message(hwnd, strings.statusline_hook, &e);
+                    }
+                }
+            }
+        }
+        InstallState::OursInstalled => {
+            if prompt_yes_no(hwnd, strings.statusline_hook, strings.hook_uninstall) {
+                if let Err(e) = hook_installer::uninstall() {
+                    show_error_message(hwnd, strings.statusline_hook, &e);
+                }
+            }
+        }
+        InstallState::OtherInstalled(existing) => {
+            let message = strings.hook_other_installed.replace("{command}", &existing);
+            let snippet = hook_installer::snippet();
+            let full = format!("{}\n\n{}:\n{}", message, strings.hook_show_snippet, snippet);
+            if prompt_yes_no(hwnd, strings.statusline_hook, &full) {
+                match hook_installer::install() {
+                    Ok(backup) => {
+                        let msg = format!(
+                            "{}\n\n{}\n{}",
+                            strings.hook_installed,
+                            strings.hook_backup_created,
+                            backup.display()
+                        );
+                        show_info_message(hwnd, strings.statusline_hook, &msg);
+                    }
+                    Err(e) => {
+                        show_error_message(hwnd, strings.statusline_hook, &e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn prompt_yes_no(hwnd: HWND, title: &str, message: &str) -> bool {
+    unsafe {
+        let title_wide = native_interop::wide_str(title);
+        let message_wide = native_interop::wide_str(message);
+        MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(message_wide.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
 fn show_context_menu(hwnd: HWND) {
     unsafe {
         let (
@@ -1883,6 +2122,7 @@ fn show_context_menu(hwnd: HWND) {
             install_channel,
             update_status,
             widget_visible,
+            auto_hide_when_idle,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -1894,6 +2134,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.install_channel,
                     s.update_status.clone(),
                     s.widget_visible,
+                    s.auto_hide_when_idle,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -1903,9 +2144,12 @@ fn show_context_menu(hwnd: HWND) {
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
+                    false,
                 ),
             }
         };
+
+        let hook_state = hook_installer::status();
 
         let menu = CreatePopupMenu().unwrap();
 
@@ -1972,6 +2216,33 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
         );
 
+        let auto_hide_str = native_interop::wide_str(strings.only_show_while_active);
+        let auto_hide_flags = if auto_hide_when_idle {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            auto_hide_flags,
+            IDM_AUTO_HIDE as usize,
+            PCWSTR::from_raw(auto_hide_str.as_ptr()),
+        );
+
+        let hook_suffix = match &hook_state {
+            InstallState::NotConfigured => strings.hook_not_configured,
+            InstallState::OursInstalled => strings.hook_installed,
+            InstallState::OtherInstalled(_) => strings.hook_other_installed_short,
+        };
+        let hook_label = format!("{}: {}", strings.statusline_hook, hook_suffix);
+        let hook_str = native_interop::wide_str(&hook_label);
+        let _ = AppendMenuW(
+            settings_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_HOOK_STATUS as usize,
+            PCWSTR::from_raw(hook_str.as_ptr()),
+        );
+
         let language_menu = CreatePopupMenu().unwrap();
         let system_label = native_interop::wide_str(strings.system_default);
         let system_flags = if language_override.is_none() {
@@ -2022,8 +2293,10 @@ fn show_context_menu(hwnd: HWND) {
         let version_label =
             version_action_label(strings, language, install_channel, &update_status);
         let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if matches!(update_status, UpdateStatus::Checking | UpdateStatus::Applying)
-        {
+        let version_flags = if matches!(
+            update_status,
+            UpdateStatus::Checking | UpdateStatus::Applying
+        ) {
             MF_GRAYED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -2044,7 +2317,11 @@ fn show_context_menu(hwnd: HWND) {
         );
 
         let widget_label = native_interop::wide_str(strings.show_widget);
-        let widget_flags = if widget_visible { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
+        let widget_flags = if widget_visible {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
         let _ = AppendMenuW(
             menu,
             widget_flags,

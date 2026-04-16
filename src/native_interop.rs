@@ -23,6 +23,10 @@ pub const TIMER_UPDATE_CHECK: usize = 4;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
+pub const WM_APP_HEARTBEAT: u32 = WM_APP + 4;
+
+// Window class name of the widget; used by the statusline helper to find us via FindWindowW.
+pub const WIDGET_WINDOW_CLASS: &str = "ClaudeCodeUsageMonitorWidget";
 
 /// Get the taskbar window handle
 pub fn find_taskbar() -> Option<HWND> {

@@ -1251,6 +1251,7 @@ fn render_layered() {
 }
 
 /// Paint all widget content onto a DC with a given background color.
+#[allow(clippy::too_many_arguments)]
 fn paint_content(
     hdc: HDC,
     width: i32,
@@ -1798,11 +1799,9 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                         let widget_width = total_widget_width();
-                        let max_offset = if s.embedded {
-                            tray_left - taskbar_rect.left - widget_width
-                        } else {
-                            tray_left - taskbar_rect.left - widget_width
-                        };
+                        // TODO(upstream): both branches were identical; the embedded/non-embedded
+                        // split was presumably intended to diverge. Collapsed to unblock clippy.
+                        let max_offset = tray_left - taskbar_rect.left - widget_width;
                         if new_offset > max_offset {
                             new_offset = max_offset;
                         }
@@ -2419,6 +2418,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     hdc: HDC,
     x: i32,

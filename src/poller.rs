@@ -417,7 +417,10 @@ fn read_windows_credentials() -> Option<Credentials> {
         Err(error) => {
             if diagnose::is_enabled() {
                 diagnose::log_error(
-                    &format!("unable to read Windows credentials at {}", cred_path.display()),
+                    &format!(
+                        "unable to read Windows credentials at {}",
+                        cred_path.display()
+                    ),
                     error,
                 );
             }
@@ -533,7 +536,7 @@ fn decode_wsl_text(bytes: &[u8]) -> String {
 }
 
 fn decode_utf16le(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
 
@@ -638,7 +641,7 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 /// Format a usage section as "X% · Yh" style text

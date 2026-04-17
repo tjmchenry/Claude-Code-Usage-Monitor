@@ -138,6 +138,13 @@ pub struct Strings {
     pub hook_uninstall: &'static str,
     pub hook_backup_created: &'static str,
     pub auto_hide_hook_not_installed: &'static str,
+    pub data_source: &'static str,
+    pub data_source_api: &'static str,
+    pub data_source_local: &'static str,
+    pub data_source_hybrid: &'static str,
+    pub refresh_interval_60: &'static str,
+    pub data_source_switched_to_local: &'static str,
+    pub refresh_interval_set: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

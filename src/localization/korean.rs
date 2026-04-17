@@ -46,4 +46,11 @@ pub(super) const STRINGS: Strings = Strings {
     hook_uninstall: "Claude Code Usage Monitor statusLine 훅을 Claude Code 설정에서 제거하시겠습니까?",
     hook_backup_created: "Claude Code 설정의 백업이 다음 위치에 저장되었습니다:",
     auto_hide_hook_not_installed: "자동 숨기기가 켜져 있지만 statusLine 훅이 설치되지 않았습니다. 설정을 열어 구성하세요.",
+    data_source: "데이터 소스",
+    data_source_api: "API",
+    data_source_local: "로컬 (statusLine 훅 사용)",
+    data_source_hybrid: "하이브리드",
+    refresh_interval_60: "statusLine 을 60 초마다 갱신",
+    data_source_switched_to_local: "statusLine 훅이 사용량 데이터를 제공하므로 데이터 소스를 로컬로 전환했습니다.",
+    refresh_interval_set: "Claude Code 는 유휴 상태에서 60 초마다 statusLine 을 갱신합니다.",
 };

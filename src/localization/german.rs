@@ -46,4 +46,11 @@ pub(super) const STRINGS: Strings = Strings {
     hook_uninstall: "Den Claude Code Usage Monitor statusLine-Hook aus Ihren Claude Code-Einstellungen entfernen?",
     hook_backup_created: "Eine Sicherung Ihrer Claude Code-Einstellungen wurde gespeichert unter:",
     auto_hide_hook_not_installed: "Automatisches Ausblenden ist aktiv, aber der statusLine-Hook ist nicht installiert. Öffnen Sie die Einstellungen, um ihn zu konfigurieren.",
+    data_source: "Datenquelle",
+    data_source_api: "API",
+    data_source_local: "Lokal (über statusLine-Hook)",
+    data_source_hybrid: "Hybrid",
+    refresh_interval_60: "statusLine alle 60 s aktualisieren",
+    data_source_switched_to_local: "Die Datenquelle wurde auf Lokal umgestellt, da der statusLine-Hook jetzt Nutzungsdaten liefert.",
+    refresh_interval_set: "Claude Code aktualisiert seine statusLine nun während der Inaktivität alle 60 Sekunden.",
 };

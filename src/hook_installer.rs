@@ -170,6 +170,55 @@ fn backup_settings(path: &std::path::Path) -> Result<PathBuf, String> {
     Ok(backup)
 }
 
+/// Read the current `statusLine.refreshInterval` from `~/.claude/settings.json`
+/// if present. Returns None when the file or key doesn't exist.
+pub fn current_refresh_interval() -> Option<u64> {
+    let path = settings_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    value
+        .get("statusLine")?
+        .get("refreshInterval")?
+        .as_u64()
+}
+
+/// Write `statusLine.refreshInterval = secs` into `~/.claude/settings.json`,
+/// preserving any other keys and backing up the file first. No-op if the file
+/// has no statusLine entry yet — callers should only invoke this after the
+/// hook is installed.
+pub fn set_refresh_interval(secs: u64) -> Result<(), String> {
+    let path = settings_path().ok_or_else(|| "home directory not found".to_string())?;
+    let existing = fs::read_to_string(&path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut value: Value = serde_json::from_str(&existing)
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+
+    let _backup = backup_settings(&path)?;
+    set_refresh_interval_into(&mut value, secs);
+
+    let serialized =
+        serde_json::to_string_pretty(&value).map_err(|e| format!("serialize: {e}"))?;
+    fs::write(&path, serialized).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn set_refresh_interval_into(value: &mut Value, secs: u64) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let entry = obj.entry("statusLine".to_string()).or_insert_with(|| {
+        Value::Object(Map::new())
+    });
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    let map = entry.as_object_mut().unwrap();
+    map.insert(
+        "refreshInterval".to_string(),
+        Value::Number(secs.into()),
+    );
+}
+
 /// Rendering snippet shown in a "Show snippet" message box so the user can copy
 /// the install by hand (e.g. on WSL-only setups).
 pub fn snippet() -> String {

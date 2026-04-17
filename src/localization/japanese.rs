@@ -46,4 +46,11 @@ pub(super) const STRINGS: Strings = Strings {
     hook_uninstall: "Claude Code Usage Monitor の statusLine フックを Claude Code の設定から削除しますか？",
     hook_backup_created: "Claude Code の設定のバックアップが次の場所に保存されました:",
     auto_hide_hook_not_installed: "自動非表示は有効ですが、statusLine フックがインストールされていません。設定を開いて構成してください。",
+    data_source: "データソース",
+    data_source_api: "API",
+    data_source_local: "ローカル（statusLine フック経由）",
+    data_source_hybrid: "ハイブリッド",
+    refresh_interval_60: "statusLine を 60 秒ごとに更新",
+    data_source_switched_to_local: "statusLine フックが使用量データを提供するようになったため、データソースをローカルに切り替えました。",
+    refresh_interval_set: "Claude Code はアイドル時に 60 秒ごとに statusLine を更新します。",
 };

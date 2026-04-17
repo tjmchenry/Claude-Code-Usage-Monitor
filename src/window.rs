@@ -22,7 +22,7 @@ use crate::diagnose;
 use crate::hook_installer::{self, InstallState};
 use crate::localization::{self, LanguageId, Strings};
 use crate::local_mode::LocalSource;
-use crate::models::{DataSource, RateLimits, UsageData};
+use crate::models::{DataSource, RateLimitBucket, RateLimits, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK,
     WIDGET_WINDOW_CLASS, WM_APP_HEARTBEAT, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
@@ -97,6 +97,7 @@ struct AppState {
     // so Local reads stay authoritative when the hook goes quiet.
     last_rate_limits: Option<RateLimits>,
     rate_limits_captured_at: Option<Instant>,
+    hybrid_fallback_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -132,11 +133,19 @@ const IDM_LANG_JAPANESE: u16 = 45;
 const IDM_LANG_KOREAN: u16 = 46;
 const IDM_AUTO_HIDE: u16 = 60;
 const IDM_HOOK_STATUS: u16 = 61;
+const IDM_DATA_SOURCE_API: u16 = 70;
+const IDM_DATA_SOURCE_LOCAL: u16 = 71;
+const IDM_DATA_SOURCE_HYBRID: u16 = 72;
+const IDM_REFRESH_INTERVAL_60: u16 = 73;
 
 /// Default window of time (seconds) without a heartbeat before a session is considered gone.
 /// Claude Code fires statusLine at <=1 Hz during active sessions, so six seconds covers a
 /// short network stall without rendering a dead session "alive."
 const DEFAULT_STALE_SESSION_SECS: u64 = 6;
+/// How long Hybrid treats a hook-captured rate_limits snapshot as fresh
+/// before falling back to the API. Default 20 min: longer than a typical
+/// active burst, shorter than a long idle gap.
+const DEFAULT_HYBRID_FALLBACK_SECS: u64 = 20 * 60;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -265,6 +274,8 @@ struct SettingsFile {
     stale_session_secs: u64,
     #[serde(default)]
     data_source: DataSource,
+    #[serde(default = "default_hybrid_fallback_secs")]
+    hybrid_fallback_secs: u64,
 }
 
 impl Default for SettingsFile {
@@ -278,6 +289,7 @@ impl Default for SettingsFile {
             auto_hide_when_idle: false,
             stale_session_secs: default_stale_session_secs(),
             data_source: DataSource::default(),
+            hybrid_fallback_secs: default_hybrid_fallback_secs(),
         }
     }
 }
@@ -292,6 +304,10 @@ fn default_widget_visible() -> bool {
 
 fn default_stale_session_secs() -> u64 {
     DEFAULT_STALE_SESSION_SECS
+}
+
+fn default_hybrid_fallback_secs() -> u64 {
+    DEFAULT_HYBRID_FALLBACK_SECS
 }
 
 fn load_settings() -> SettingsFile {
@@ -326,6 +342,7 @@ fn save_state_settings() {
             auto_hide_when_idle: s.auto_hide_when_idle,
             stale_session_secs: s.stale_session_secs,
             data_source: s.data_source,
+            hybrid_fallback_secs: s.hybrid_fallback_secs,
         });
     }
 }
@@ -435,6 +452,45 @@ fn toggle_auto_hide(hwnd: HWND) {
     apply_visibility(hwnd);
     let (pct, tooltip) = tray_icon_data_from_state();
     tray_icon::update(hwnd, pct, &tooltip);
+}
+
+fn set_data_source(hwnd: HWND, new_source: DataSource) {
+    let changed = {
+        let mut state = lock_state();
+        match state.as_mut() {
+            Some(s) if s.data_source != new_source => {
+                s.data_source = new_source;
+                true
+            }
+            _ => false,
+        }
+    };
+    if !changed {
+        return;
+    }
+    save_state_settings();
+    // Repoll immediately so the widget reflects the new source without waiting
+    // for the next TIMER_POLL tick.
+    let sh = SendHwnd::from_hwnd(hwnd);
+    std::thread::spawn(move || do_poll(sh));
+}
+
+fn handle_refresh_interval_click(hwnd: HWND) {
+    let strings = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.language.strings())
+            .unwrap_or_else(|| LanguageId::English.strings())
+    };
+    match hook_installer::set_refresh_interval(60) {
+        Ok(()) => {
+            show_info_message(hwnd, strings.statusline_hook, strings.refresh_interval_set);
+        }
+        Err(e) => {
+            show_error_message(hwnd, strings.statusline_hook, &e);
+        }
+    }
 }
 
 /// Handle a `WM_COPYDATA` message from the statusLine helper. The payload is a
@@ -1081,6 +1137,7 @@ pub fn run() {
                 data_source: settings.data_source,
                 last_rate_limits: None,
                 rate_limits_captured_at: None,
+                hybrid_fallback_secs: settings.hybrid_fallback_secs.max(30),
             });
         }
 
@@ -1449,24 +1506,103 @@ fn paint_content(
     }
 }
 
+/// Snapshot of the bits of AppState poll dispatch needs, captured up-front so
+/// the mutex is released for the duration of the (potentially slow) API call.
+struct PollContext {
+    source: DataSource,
+    rate_limits: Option<RateLimits>,
+    rate_limits_age: Option<Duration>,
+    hybrid_fallback_secs: u64,
+}
+
+fn snapshot_poll_context() -> PollContext {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) => PollContext {
+            source: s.data_source,
+            rate_limits: s.last_rate_limits.clone(),
+            rate_limits_age: s.rate_limits_captured_at.map(|t| t.elapsed()),
+            hybrid_fallback_secs: s.hybrid_fallback_secs,
+        },
+        None => PollContext {
+            source: DataSource::default(),
+            rate_limits: None,
+            rate_limits_age: None,
+            hybrid_fallback_secs: DEFAULT_HYBRID_FALLBACK_SECS,
+        },
+    }
+}
+
 /// Pick a `UsageSource` based on the current `AppState::data_source` and run
-/// one poll cycle. HybridSource composition lands in B.4; for now Hybrid
-/// behaves like Api.
+/// one poll cycle.
 fn poll_via_current_source() -> Result<UsageData, poller::PollError> {
     use poller::UsageSource;
-    let (source, rate_limits) = {
-        let state = lock_state();
-        match state.as_ref() {
-            Some(s) => (s.data_source, s.last_rate_limits.clone()),
-            None => (DataSource::default(), None),
-        }
-    };
-    match source {
-        DataSource::Api | DataSource::Hybrid => poller::ApiSource.poll(),
+    let ctx = snapshot_poll_context();
+
+    match ctx.source {
+        DataSource::Api => poller::ApiSource.poll(),
         DataSource::Local => LocalSource {
-            rate_limits: rate_limits.as_ref(),
+            rate_limits: ctx.rate_limits.as_ref(),
         }
         .poll(),
+        DataSource::Hybrid => poll_hybrid(&ctx),
+    }
+}
+
+/// Hybrid: prefer the hook-fed rate_limits when they're fresh; otherwise hit
+/// the API and fold the response back into `last_rate_limits` so subsequent
+/// Local reads stay authoritative even if the hook goes quiet.
+fn poll_hybrid(ctx: &PollContext) -> Result<UsageData, poller::PollError> {
+    use poller::UsageSource;
+    let fresh = matches!(
+        ctx.rate_limits_age,
+        Some(age) if age < Duration::from_secs(ctx.hybrid_fallback_secs)
+    );
+    if fresh {
+        let local = LocalSource {
+            rate_limits: ctx.rate_limits.as_ref(),
+        };
+        if let Ok(mut data) = local.poll() {
+            data.source = DataSource::Hybrid;
+            return Ok(data);
+        }
+    }
+
+    let mut data = poller::ApiSource.poll()?;
+    data.source = DataSource::Hybrid;
+    fold_api_into_last_rate_limits(&data);
+    Ok(data)
+}
+
+/// After a successful API call in Hybrid mode, stash the authoritative result
+/// in AppState::last_rate_limits so Local reads pick up from there.
+fn fold_api_into_last_rate_limits(data: &UsageData) {
+    let five = data
+        .session
+        .resets_at
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| RateLimitBucket {
+            used: data.session.percentage,
+            resets_at_unix: d.as_secs() as i64,
+        });
+    let seven = data
+        .weekly
+        .resets_at
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| RateLimitBucket {
+            used: data.weekly.percentage,
+            resets_at_unix: d.as_secs() as i64,
+        });
+    if five.is_none() && seven.is_none() {
+        return;
+    }
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        s.last_rate_limits = Some(RateLimits {
+            five_hour: five,
+            seven_day: seven,
+        });
+        s.rate_limits_captured_at = Some(Instant::now());
     }
 }
 
@@ -1499,6 +1635,19 @@ fn do_poll(send_hwnd: SendHwnd) {
                 }
             }
 
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+            }
+        }
+        Err(poller::PollError::NoData) => {
+            // Local mode with no heartbeat yet. Don't bump retry backoff —
+            // the next WM_COPYDATA from the hook will repoll immediately.
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.session_text = "...".to_string();
+                s.weekly_text = "...".to_string();
+                s.last_poll_ok = false;
+            }
             unsafe {
                 let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
             }
@@ -2114,6 +2263,10 @@ unsafe extern "system" fn wnd_proc(
                 IDM_HOOK_STATUS => {
                     handle_hook_status_click(hwnd);
                 }
+                IDM_DATA_SOURCE_API => set_data_source(hwnd, DataSource::Api),
+                IDM_DATA_SOURCE_LOCAL => set_data_source(hwnd, DataSource::Local),
+                IDM_DATA_SOURCE_HYBRID => set_data_source(hwnd, DataSource::Hybrid),
+                IDM_REFRESH_INTERVAL_60 => handle_refresh_interval_click(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -2169,12 +2322,16 @@ fn handle_hook_status_click(hwnd: HWND) {
             if prompt_yes_no(hwnd, strings.statusline_hook, &prompt) {
                 match hook_installer::install() {
                     Ok(backup) => {
-                        let message = format!(
+                        let mut message = format!(
                             "{}\n\n{}\n{}",
                             strings.hook_installed,
                             strings.hook_backup_created,
                             backup.display()
                         );
+                        if auto_switch_to_local_on_install() {
+                            message.push_str("\n\n");
+                            message.push_str(strings.data_source_switched_to_local);
+                        }
                         show_info_message(hwnd, strings.statusline_hook, &message);
                     }
                     Err(e) => {
@@ -2197,12 +2354,16 @@ fn handle_hook_status_click(hwnd: HWND) {
             if prompt_yes_no(hwnd, strings.statusline_hook, &full) {
                 match hook_installer::install() {
                     Ok(backup) => {
-                        let msg = format!(
+                        let mut msg = format!(
                             "{}\n\n{}\n{}",
                             strings.hook_installed,
                             strings.hook_backup_created,
                             backup.display()
                         );
+                        if auto_switch_to_local_on_install() {
+                            msg.push_str("\n\n");
+                            msg.push_str(strings.data_source_switched_to_local);
+                        }
                         show_info_message(hwnd, strings.statusline_hook, &msg);
                     }
                     Err(e) => {
@@ -2212,6 +2373,27 @@ fn handle_hook_status_click(hwnd: HWND) {
             }
         }
     }
+}
+
+/// After a successful hook install, switch data_source to Local if (and only
+/// if) the user is still on the factory default. Respects any explicit choice
+/// the user has already made in the Data Source submenu. Returns true if the
+/// switch actually happened, so the caller can surface a confirmation.
+fn auto_switch_to_local_on_install() -> bool {
+    let switched = {
+        let mut state = lock_state();
+        match state.as_mut() {
+            Some(s) if matches!(s.data_source, DataSource::Api) => {
+                s.data_source = DataSource::Local;
+                true
+            }
+            _ => false,
+        }
+    };
+    if switched {
+        save_state_settings();
+    }
+    switched
 }
 
 fn prompt_yes_no(hwnd: HWND, title: &str, message: &str) -> bool {
@@ -2238,6 +2420,7 @@ fn show_context_menu(hwnd: HWND) {
             update_status,
             widget_visible,
             auto_hide_when_idle,
+            data_source,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2250,6 +2433,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.update_status.clone(),
                     s.widget_visible,
                     s.auto_hide_when_idle,
+                    s.data_source,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2260,6 +2444,7 @@ fn show_context_menu(hwnd: HWND) {
                     UpdateStatus::Idle,
                     true,
                     false,
+                    DataSource::default(),
                 ),
             }
         };
@@ -2357,6 +2542,73 @@ fn show_context_menu(hwnd: HWND) {
             IDM_HOOK_STATUS as usize,
             PCWSTR::from_raw(hook_str.as_ptr()),
         );
+
+        // Data source submenu (API / Local / Hybrid)
+        let data_source_menu = CreatePopupMenu().unwrap();
+        let api_flags = if matches!(data_source, DataSource::Api) {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let local_flags = if matches!(data_source, DataSource::Local) {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let hybrid_flags = if matches!(data_source, DataSource::Hybrid) {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let api_str = native_interop::wide_str(strings.data_source_api);
+        let local_str = native_interop::wide_str(strings.data_source_local);
+        let hybrid_str = native_interop::wide_str(strings.data_source_hybrid);
+        let _ = AppendMenuW(
+            data_source_menu,
+            api_flags,
+            IDM_DATA_SOURCE_API as usize,
+            PCWSTR::from_raw(api_str.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            data_source_menu,
+            local_flags,
+            IDM_DATA_SOURCE_LOCAL as usize,
+            PCWSTR::from_raw(local_str.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            data_source_menu,
+            hybrid_flags,
+            IDM_DATA_SOURCE_HYBRID as usize,
+            PCWSTR::from_raw(hybrid_str.as_ptr()),
+        );
+        let data_source_label = native_interop::wide_str(strings.data_source);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            data_source_menu.0 as usize,
+            PCWSTR::from_raw(data_source_label.as_ptr()),
+        );
+
+        // Only offer the "refresh statusLine every 60s" toggle when the hook is
+        // actually ours; it rewrites ~/.claude/settings.json and pointing it at
+        // someone else's statusLine would be rude.
+        if matches!(hook_state, InstallState::OursInstalled) {
+            let refresh_interval_str = native_interop::wide_str(strings.refresh_interval_60);
+            let refresh_interval_flags = if hook_installer::current_refresh_interval()
+                .map(|v| v <= 60)
+                .unwrap_or(false)
+            {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                settings_menu,
+                refresh_interval_flags,
+                IDM_REFRESH_INTERVAL_60 as usize,
+                PCWSTR::from_raw(refresh_interval_str.as_ptr()),
+            );
+        }
 
         let language_menu = CreatePopupMenu().unwrap();
         let system_label = native_interop::wide_str(strings.system_default);

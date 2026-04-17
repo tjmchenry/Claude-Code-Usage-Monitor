@@ -46,4 +46,11 @@ pub(super) const STRINGS: Strings = Strings {
     hook_uninstall: "¿Eliminar el hook de statusLine de Claude Code Usage Monitor de tu configuración de Claude Code?",
     hook_backup_created: "Se guardó una copia de seguridad de tu configuración de Claude Code en:",
     auto_hide_hook_not_installed: "El ocultamiento automático está activado, pero el hook de statusLine no está instalado. Abre Configuración para configurarlo.",
+    data_source: "Fuente de datos",
+    data_source_api: "API",
+    data_source_local: "Local (vía hook de statusLine)",
+    data_source_hybrid: "Híbrido",
+    refresh_interval_60: "Actualizar statusLine cada 60 s",
+    data_source_switched_to_local: "Se cambió a la fuente de datos Local porque el hook de statusLine ahora proporciona datos de uso.",
+    refresh_interval_set: "Claude Code actualizará su statusLine cada 60 segundos durante la inactividad.",
 };

@@ -240,13 +240,10 @@ mod tests {
             "statusLine": {"type": "command", "command": "old"}
         });
         install_into(&mut v, "C:\\new.exe");
-        assert_eq!(
-            v["statusLine"]["command"]
-                .as_str()
-                .unwrap()
-                .contains("new.exe"),
-            true
-        );
+        assert!(v["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("new.exe"));
     }
 
     #[test]

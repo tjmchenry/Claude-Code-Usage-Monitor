@@ -45,4 +45,5 @@ pub(super) const STRINGS: Strings = Strings {
     hook_show_snippet: "スニペット",
     hook_uninstall: "Claude Code Usage Monitor の statusLine フックを Claude Code の設定から削除しますか？",
     hook_backup_created: "Claude Code の設定のバックアップが次の場所に保存されました:",
+    auto_hide_hook_not_installed: "自動非表示は有効ですが、statusLine フックがインストールされていません。設定を開いて構成してください。",
 };

@@ -45,4 +45,5 @@ pub(super) const STRINGS: Strings = Strings {
     hook_show_snippet: "Fragmento",
     hook_uninstall: "¿Eliminar el hook de statusLine de Claude Code Usage Monitor de tu configuración de Claude Code?",
     hook_backup_created: "Se guardó una copia de seguridad de tu configuración de Claude Code en:",
+    auto_hide_hook_not_installed: "El ocultamiento automático está activado, pero el hook de statusLine no está instalado. Abre Configuración para configurarlo.",
 };

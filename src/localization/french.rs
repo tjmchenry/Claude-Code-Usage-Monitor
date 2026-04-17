@@ -45,4 +45,5 @@ pub(super) const STRINGS: Strings = Strings {
     hook_show_snippet: "Extrait",
     hook_uninstall: "Supprimer le hook statusLine Claude Code Usage Monitor de votre configuration Claude Code ?",
     hook_backup_created: "Une sauvegarde de votre configuration Claude Code a été enregistrée dans :",
+    auto_hide_hook_not_installed: "Le masquage automatique est activé, mais le hook statusLine n'est pas installé. Ouvrez les Paramètres pour le configurer.",
 };

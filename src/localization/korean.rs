@@ -45,4 +45,5 @@ pub(super) const STRINGS: Strings = Strings {
     hook_show_snippet: "스니펫",
     hook_uninstall: "Claude Code Usage Monitor statusLine 훅을 Claude Code 설정에서 제거하시겠습니까?",
     hook_backup_created: "Claude Code 설정의 백업이 다음 위치에 저장되었습니다:",
+    auto_hide_hook_not_installed: "자동 숨기기가 켜져 있지만 statusLine 훅이 설치되지 않았습니다. 설정을 열어 구성하세요.",
 };

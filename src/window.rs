@@ -316,14 +316,38 @@ fn save_state_settings() {
 }
 
 fn tray_icon_data_from_state() -> (Option<f64>, String) {
-    let state = lock_state();
-    match state.as_ref() {
-        Some(s) if s.last_poll_ok => {
-            let tooltip = format!("5h: {} | 7d: {}", s.session_text, s.weekly_text);
-            (Some(s.session_percent), tooltip)
+    let (pct, mut tooltip, needs_hook_hint, strings) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) if s.last_poll_ok => {
+                let tip = format!("5h: {} | 7d: {}", s.session_text, s.weekly_text);
+                let hint = s.auto_hide_when_idle && !s.hook_ever_heartbeat;
+                (Some(s.session_percent), tip, hint, s.language.strings())
+            }
+            Some(s) => {
+                let hint = s.auto_hide_when_idle && !s.hook_ever_heartbeat;
+                (
+                    None,
+                    "Claude Code Usage Monitor".to_string(),
+                    hint,
+                    s.language.strings(),
+                )
+            }
+            None => (
+                None,
+                "Claude Code Usage Monitor".to_string(),
+                false,
+                LanguageId::English.strings(),
+            ),
         }
-        _ => (None, "Claude Code Usage Monitor".to_string()),
+    };
+    // Only nag when auto-hide is on, the hook has never fired this session,
+    // and the installed statusLine doesn't actually point at us.
+    if needs_hook_hint && !matches!(hook_installer::status(), InstallState::OursInstalled) {
+        tooltip.push('\n');
+        tooltip.push_str(strings.auto_hide_hook_not_installed);
     }
+    (pct, tooltip)
 }
 
 /// Resolve whether the window should be shown right now based on the manual
@@ -394,6 +418,8 @@ fn toggle_auto_hide(hwnd: HWND) {
     }
     save_state_settings();
     apply_visibility(hwnd);
+    let (pct, tooltip) = tray_icon_data_from_state();
+    tray_icon::update(hwnd, pct, &tooltip);
 }
 
 /// Drop heartbeat entries that haven't been refreshed within `stale_session_secs`.
@@ -1708,14 +1734,24 @@ unsafe extern "system" fn wnd_proc(
         }
         _ if msg == WM_APP_HEARTBEAT => {
             let session_hash = wparam.0 as u64;
-            {
+            let first_heartbeat = {
                 let mut state = lock_state();
                 if let Some(s) = state.as_mut() {
                     s.active_sessions.insert(session_hash, Instant::now());
+                    let first = !s.hook_ever_heartbeat;
                     s.hook_ever_heartbeat = true;
+                    first
+                } else {
+                    false
                 }
-            }
+            };
             apply_visibility(hwnd);
+            if first_heartbeat {
+                // Drop the "hook not installed" tray tooltip note as soon as we
+                // confirm the hook is wired up.
+                let (pct, tooltip) = tray_icon_data_from_state();
+                tray_icon::update(hwnd, pct, &tooltip);
+            }
             LRESULT(0)
         }
         WM_APP_UPDATE_CHECK_COMPLETE => {

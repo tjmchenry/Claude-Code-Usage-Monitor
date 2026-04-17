@@ -137,6 +137,7 @@ pub struct Strings {
     pub hook_show_snippet: &'static str,
     pub hook_uninstall: &'static str,
     pub hook_backup_created: &'static str,
+    pub auto_hide_hook_not_installed: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

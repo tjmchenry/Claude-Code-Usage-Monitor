@@ -59,7 +59,7 @@ pub fn run() -> i32 {
         }
     }
 
-    if let (Some(h), Some(ref rl)) = (hwnd, rate_limits.as_ref()) {
+    if let (Some(h), Some(rl)) = (hwnd, rate_limits.as_ref()) {
         send_rate_limits(h, rl);
     }
 

@@ -2,6 +2,7 @@
 
 mod diagnose;
 mod hook_installer;
+mod local_mode;
 mod localization;
 mod models;
 mod native_interop;

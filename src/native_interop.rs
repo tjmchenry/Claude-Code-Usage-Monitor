@@ -28,6 +28,13 @@ pub const WM_APP_HEARTBEAT: u32 = WM_APP + 4;
 // Window class name of the widget; used by the statusline helper to find us via FindWindowW.
 pub const WIDGET_WINDOW_CLASS: &str = "ClaudeCodeUsageMonitorWidget";
 
+/// Magic number stamped into `COPYDATASTRUCT.dwData` by the statusline helper
+/// when forwarding a rate_limits payload via WM_COPYDATA. Chosen arbitrarily;
+/// any nonzero value unlikely to collide with other WM_COPYDATA senders works.
+/// Validate this on the receive side so unrelated WM_COPYDATA traffic cannot
+/// spoof a payload.
+pub const COPYDATA_RATE_LIMITS: usize = 0x43434D55; // "CCMU"
+
 /// Get the taskbar window handle
 pub fn find_taskbar() -> Option<HWND> {
     unsafe {

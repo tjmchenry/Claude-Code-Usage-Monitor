@@ -602,6 +602,21 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
     now >= exp
 }
 
+/// Parse an ISO 8601 timestamp string into unix epoch seconds. Exposed so the
+/// statusLine helper can convert `rate_limits.resets_at` without depending on
+/// chrono/time.
+pub(crate) fn iso8601_to_unix(s: Option<&str>) -> Option<i64> {
+    let s = s?;
+    let datetime_part = s.split('+').next().unwrap_or(s);
+    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
+            return i64::try_from(secs).ok();
+        }
+    }
+    None
+}
+
 /// Parse an ISO 8601 timestamp string into a SystemTime.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
     let s = s?;

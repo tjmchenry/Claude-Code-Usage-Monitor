@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -20,7 +21,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::diagnose;
 use crate::hook_installer::{self, InstallState};
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::{DataSource, UsageData};
+use crate::local_mode::LocalSource;
+use crate::models::{DataSource, RateLimits, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK,
     WIDGET_WINDOW_CLASS, WM_APP_HEARTBEAT, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
@@ -87,9 +89,14 @@ struct AppState {
     // is ignored so the widget doesn't silently disappear when the hook isn't wired up.
     hook_ever_heartbeat: bool,
 
-    // Which backend do_poll dispatches to. LocalSource/HybridSource land in B.2/B.4;
-    // today every variant still resolves to the API source.
+    // Which backend do_poll dispatches to.
     data_source: DataSource,
+
+    // Last rate_limits snapshot forwarded by the statusLine hook via WM_COPYDATA.
+    // LocalSource reads this directly; HybridSource folds API results back into it
+    // so Local reads stay authoritative when the hook goes quiet.
+    last_rate_limits: Option<RateLimits>,
+    rate_limits_captured_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -428,6 +435,43 @@ fn toggle_auto_hide(hwnd: HWND) {
     apply_visibility(hwnd);
     let (pct, tooltip) = tray_icon_data_from_state();
     tray_icon::update(hwnd, pct, &tooltip);
+}
+
+/// Handle a `WM_COPYDATA` message from the statusLine helper. The payload is a
+/// UTF-8 JSON blob serialized from `RateLimits`. Unrelated `WM_COPYDATA` traffic
+/// is rejected by `dwData` magic-number check.
+fn handle_copy_data(hwnd: HWND, lparam: LPARAM) {
+    let cds = unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref() };
+    let Some(cds) = cds else { return };
+    if cds.dwData != native_interop::COPYDATA_RATE_LIMITS {
+        return;
+    }
+    if cds.lpData.is_null() || cds.cbData == 0 {
+        return;
+    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
+    let rl: RateLimits = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let should_repoll = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        s.last_rate_limits = Some(rl);
+        s.rate_limits_captured_at = Some(Instant::now());
+        // Repoll immediately on every hook payload while in Local mode so the
+        // widget reflects the just-received numbers. Api mode ignores the hook.
+        matches!(s.data_source, DataSource::Local)
+    };
+
+    if should_repoll {
+        let sh = SendHwnd::from_hwnd(hwnd);
+        std::thread::spawn(move || do_poll(sh));
+    }
 }
 
 /// Drop heartbeat entries that haven't been refreshed within `stale_session_secs`.
@@ -1035,6 +1079,8 @@ pub fn run() {
                 stale_session_secs: settings.stale_session_secs.max(1),
                 hook_ever_heartbeat: false,
                 data_source: settings.data_source,
+                last_rate_limits: None,
+                rate_limits_captured_at: None,
             });
         }
 
@@ -1404,16 +1450,23 @@ fn paint_content(
 }
 
 /// Pick a `UsageSource` based on the current `AppState::data_source` and run
-/// one poll cycle. LocalSource and HybridSource land in later phases; today
-/// every variant still dispatches to ApiSource.
+/// one poll cycle. HybridSource composition lands in B.4; for now Hybrid
+/// behaves like Api.
 fn poll_via_current_source() -> Result<UsageData, poller::PollError> {
     use poller::UsageSource;
-    let source = {
+    let (source, rate_limits) = {
         let state = lock_state();
-        state.as_ref().map(|s| s.data_source).unwrap_or_default()
+        match state.as_ref() {
+            Some(s) => (s.data_source, s.last_rate_limits.clone()),
+            None => (DataSource::default(), None),
+        }
     };
     match source {
-        DataSource::Api | DataSource::Local | DataSource::Hybrid => poller::ApiSource.poll(),
+        DataSource::Api | DataSource::Hybrid => poller::ApiSource.poll(),
+        DataSource::Local => LocalSource {
+            rate_limits: rate_limits.as_ref(),
+        }
+        .poll(),
     }
 }
 
@@ -1776,6 +1829,10 @@ unsafe extern "system" fn wnd_proc(
                 tray_icon::update(hwnd, pct, &tooltip);
             }
             LRESULT(0)
+        }
+        WM_COPYDATA => {
+            handle_copy_data(hwnd, lparam);
+            LRESULT(1)
         }
         WM_APP_UPDATE_CHECK_COMPLETE => {
             schedule_auto_update_check(hwnd);

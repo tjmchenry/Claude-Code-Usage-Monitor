@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::diagnose;
 use crate::hook_installer::{self, InstallState};
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::UsageData;
+use crate::models::{DataSource, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK,
     WIDGET_WINDOW_CLASS, WM_APP_HEARTBEAT, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
@@ -86,6 +86,10 @@ struct AppState {
     // True once we've seen at least one heartbeat this run. Before that, auto-hide
     // is ignored so the widget doesn't silently disappear when the hook isn't wired up.
     hook_ever_heartbeat: bool,
+
+    // Which backend do_poll dispatches to. LocalSource/HybridSource land in B.2/B.4;
+    // today every variant still resolves to the API source.
+    data_source: DataSource,
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +256,8 @@ struct SettingsFile {
     auto_hide_when_idle: bool,
     #[serde(default = "default_stale_session_secs")]
     stale_session_secs: u64,
+    #[serde(default)]
+    data_source: DataSource,
 }
 
 impl Default for SettingsFile {
@@ -264,6 +270,7 @@ impl Default for SettingsFile {
             widget_visible: true,
             auto_hide_when_idle: false,
             stale_session_secs: default_stale_session_secs(),
+            data_source: DataSource::default(),
         }
     }
 }
@@ -311,6 +318,7 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             auto_hide_when_idle: s.auto_hide_when_idle,
             stale_session_secs: s.stale_session_secs,
+            data_source: s.data_source,
         });
     }
 }
@@ -1026,6 +1034,7 @@ pub fn run() {
                 auto_hide_when_idle: settings.auto_hide_when_idle,
                 stale_session_secs: settings.stale_session_secs.max(1),
                 hook_ever_heartbeat: false,
+                data_source: settings.data_source,
             });
         }
 
@@ -1394,9 +1403,23 @@ fn paint_content(
     }
 }
 
+/// Pick a `UsageSource` based on the current `AppState::data_source` and run
+/// one poll cycle. LocalSource and HybridSource land in later phases; today
+/// every variant still dispatches to ApiSource.
+fn poll_via_current_source() -> Result<UsageData, poller::PollError> {
+    use poller::UsageSource;
+    let source = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.data_source).unwrap_or_default()
+    };
+    match source {
+        DataSource::Api | DataSource::Local | DataSource::Hybrid => poller::ApiSource.poll(),
+    }
+}
+
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    match poller::poll() {
+    match poll_via_current_source() {
         Ok(data) => {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {

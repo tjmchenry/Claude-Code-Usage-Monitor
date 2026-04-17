@@ -7,7 +7,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{UsageData, UsageSection};
+use crate::models::{DataSource, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -20,6 +20,28 @@ pub enum PollError {
     NoCredentials,
     TokenExpired,
     RequestFailed,
+    /// The source has no data to return yet (e.g. LocalSource before the first
+    /// heartbeat has arrived). Hybrid treats this as "fall through to ApiSource".
+    NoData,
+}
+
+/// Something that can produce a usage snapshot. Implemented by `ApiSource`
+/// here, `LocalSource` in `local_mode`, and `HybridSource` (also in `local_mode`)
+/// which composes the two.
+pub trait UsageSource {
+    fn poll(&self) -> Result<UsageData, PollError>;
+}
+
+/// The long-standing behavior: read OAuth creds from disk, refresh if
+/// expired, hit the usage endpoint.
+pub struct ApiSource;
+
+impl UsageSource for ApiSource {
+    fn poll(&self) -> Result<UsageData, PollError> {
+        let mut data = poll()?;
+        data.source = DataSource::Api;
+        Ok(data)
+    }
 }
 
 #[derive(Deserialize)]

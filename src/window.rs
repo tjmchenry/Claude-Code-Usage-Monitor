@@ -227,25 +227,62 @@ fn current_usage_path() -> PathBuf {
         .join("current_usage.json")
 }
 
+/// How often we flush the last_rate_limits snapshot to disk. The hook fires
+/// per assistant turn (can be many times a minute), but on-disk freshness
+/// only matters for startup hydration and the statusline helper's first-turn
+/// fallback — losing up to a minute there is fine.
+const CURRENT_USAGE_FLUSH_DEBOUNCE_SECS: u64 = 60;
+
+static LAST_CURRENT_USAGE_WRITE: Mutex<Option<Instant>> = Mutex::new(None);
+
 fn write_current_usage_file() {
-    let (session_text, weekly_text, last_poll_ok) = {
+    write_current_usage_file_inner(true);
+}
+
+/// Called from the WM_COPYDATA path: updates the disk snapshot at most once
+/// per `CURRENT_USAGE_FLUSH_DEBOUNCE_SECS`. In-memory state is always fresh;
+/// this throttle only applies to the file flush.
+fn write_current_usage_file_debounced() {
+    write_current_usage_file_inner(false);
+}
+
+fn write_current_usage_file_inner(force: bool) {
+    if !force {
+        let mut last = LAST_CURRENT_USAGE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last {
+            if t.elapsed() < Duration::from_secs(CURRENT_USAGE_FLUSH_DEBOUNCE_SECS) {
+                return;
+            }
+        }
+        *last = Some(Instant::now());
+    } else {
+        let mut last = LAST_CURRENT_USAGE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        *last = Some(Instant::now());
+    }
+
+    let (session_text, weekly_text, last_poll_ok, rate_limits) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.session_text.clone(),
                 s.weekly_text.clone(),
                 s.last_poll_ok,
+                s.last_rate_limits.clone(),
             ),
             None => return,
         }
     };
-    if !last_poll_ok {
+    // Still write even when last_poll_ok is false, as long as we have
+    // rate_limits from the hook — a user running only in Local mode would
+    // otherwise never persist anything.
+    if !last_poll_ok && rate_limits.is_none() {
         return;
     }
 
     let payload = serde_json::json!({
         "session_text": session_text,
         "weekly_text": weekly_text,
+        "rate_limits": rate_limits,
     });
     let path = current_usage_path();
     if let Some(parent) = path.parent() {
@@ -254,6 +291,20 @@ fn write_current_usage_file() {
     if let Ok(json) = serde_json::to_string(&payload) {
         let _ = std::fs::write(&path, json);
     }
+}
+
+/// Load `last_rate_limits` from disk so LocalSource has something to serve
+/// before the first heartbeat of a new session. Silently no-ops if the file
+/// doesn't exist or has no rate_limits key.
+fn hydrate_rate_limits_from_disk() -> Option<RateLimits> {
+    let path = current_usage_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let rl_value = value.get("rate_limits")?.clone();
+    if rl_value.is_null() {
+        return None;
+    }
+    serde_json::from_value(rl_value).ok()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -523,6 +574,8 @@ fn handle_copy_data(hwnd: HWND, lparam: LPARAM) {
         // widget reflects the just-received numbers. Api mode ignores the hook.
         matches!(s.data_source, DataSource::Local)
     };
+
+    write_current_usage_file_debounced();
 
     if should_repoll {
         let sh = SendHwnd::from_hwnd(hwnd);
@@ -1135,7 +1188,10 @@ pub fn run() {
                 stale_session_secs: settings.stale_session_secs.max(1),
                 hook_ever_heartbeat: false,
                 data_source: settings.data_source,
-                last_rate_limits: None,
+                last_rate_limits: hydrate_rate_limits_from_disk(),
+                // Treat hydrated data as immediately-stale so Hybrid falls
+                // back to the API on first poll if no heartbeat has landed
+                // by then. LocalSource still serves the cached values.
                 rate_limits_captured_at: None,
                 hybrid_fallback_secs: settings.hybrid_fallback_secs.max(30),
             });
